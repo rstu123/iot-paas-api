@@ -8,6 +8,12 @@ const config = require('../config');
 const projectsRouter = require('./routes/projects');
 const devicesRouter = require('./routes/devices');
 const provisionRouter = require('./routes/provision');
+const mqttRouter = require('./routes/mqtt');
+const firmwareRouter = require('./routes/firmware');
+const mqttService = require('./services/mqtt');
+const batchRouter = require('./routes/batch');
+const subscriptionRouter = require('./routes/subscription');
+const adminRouter = require('./routes/admin');
 
 // Create Express app
 const app = express();
@@ -21,12 +27,16 @@ app.use(helmet());
 
 // CORS - configure for your frontend domain in production
 app.use(cors({
-  origin: config.nodeEnv === 'production' 
-    ? ['https://yourdomain.com'] 
-    : ['http://localhost:3000', 'http://localhost:5173'],
+  origin: [
+    'https://iot-paas-dashboard.vercel.app',
+    'https://iot-paas.io.vn',
+    'https://www.iot-paas.io.vn',
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'null',
+  ],
   credentials: true,
 }));
-
 // Request logging
 app.use(morgan(config.nodeEnv === 'production' ? 'combined' : 'dev'));
 
@@ -50,6 +60,11 @@ app.get('/health', (req, res) => {
 app.use('/api/projects', projectsRouter);
 app.use('/api/devices', devicesRouter);
 app.use('/api/provision', provisionRouter);
+app.use('/api/mqtt', mqttRouter);
+app.use('/api/devices', firmwareRouter);
+app.use('/api/batch', batchRouter);
+app.use('/api/subscription', subscriptionRouter);
+app.use('/api/admin', adminRouter);
 
 // ===================
 // Error Handling
@@ -81,6 +96,8 @@ app.use((err, req, res, next) => {
 
 const PORT = config.port;
 
+mqttService.connect();
+
 app.listen(PORT, () => {
   console.log(`
 ╔═══════════════════════════════════════════════════╗
@@ -96,7 +113,9 @@ app.listen(PORT, () => {
 ║  • POST /api/projects                             ║
 ║  • GET  /api/devices                              ║
 ║  • POST /api/devices                              ║
-║  • POST /api/provision                            ║
+║  • POST /api/provision
+║  • POST /api/devices/:id/firmware             ║
+║  • GET  /api/devices/:id/firmware             ║                            ║
 ╚═══════════════════════════════════════════════════╝
   `);
 });

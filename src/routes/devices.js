@@ -2,11 +2,14 @@ const express = require('express');
 const { body, param, query, validationResult } = require('express-validator');
 const { authenticate } = require('../middleware/auth');
 const { supabaseAdmin } = require('../services/supabase');
+const { attachTier } = require('../middleware/subscription');
 
 const router = express.Router();
 
 // All routes require authentication
 router.use(authenticate);
+
+router.use(attachTier);
 
 // Validation helper
 const validate = (req, res, next) => {
@@ -121,6 +124,21 @@ router.post('/',
       
       if (projectError || !project) {
         return res.status(404).json({ error: 'Project not found' });
+      }
+
+	// ─── Tier enforcement ───
+      const { count: deviceCount } = await req.supabase
+        .from('devices')
+        .select('*', { count: 'exact', head: true })
+        .eq('project_id', project_id);
+
+      if (req.limits.max_devices_per_project !== Infinity && deviceCount >= req.limits.max_devices_per_project) {
+        return res.status(403).json({
+          error: `Free tier is limited to ${req.limits.max_devices_per_project} devices per project. Upgrade to add more.`,
+          tier: req.tier,
+          limit: req.limits.max_devices_per_project,
+          current: deviceCount,
+        });
       }
       
       // Generate device token using the database function
@@ -267,6 +285,188 @@ router.post('/:id/regenerate-token',
     } catch (err) {
       console.error('Error regenerating token:', err);
       res.status(500).json({ error: 'Failed to regenerate token' });
+    }
+  }
+);
+
+/**
+ * GET /api/devices/:id/credentials
+ * Get MQTT connection credentials for a device
+ */
+router.get('/:id/credentials',
+  param('id').isUUID(),
+  validate,
+  async (req, res) => {
+    try {
+      const { data: device, error } = await req.supabase
+        .from('devices')
+        .select(`
+          id,
+          name,
+          device_token,
+          project:projects!inner(user_id)
+        `)
+        .eq('id', req.params.id)
+        .single();
+
+      if (error || !device) {
+        return res.status(404).json({ error: 'Device not found' });
+      }
+
+      const user_id = device.project.user_id;
+
+      res.json({
+        device_name: device.name,
+        mqtt: {
+          host: process.env.MQTT_HOST || 'localhost',
+          port: 1883,
+          ssl_port: 8883,
+          websocket_port: 8083,
+          username: device.id,
+          password: device.device_token
+        },
+        topics: {
+          publish: `u/${user_id}/d/${device.id}/up/+`,
+          subscribe: `u/${user_id}/d/${device.id}/down/+`
+        }
+      });
+    } catch (err) {
+      console.error('Error fetching credentials:', err);
+      res.status(500).json({ error: 'Failed to fetch credentials' });
+    }
+  }
+);
+
+// =============================================
+// Channel CRUD endpoints
+// =============================================
+
+/**
+ * POST /api/devices/:id/channels
+ * Create a new channel for a device
+ */
+router.post('/:id/channels',
+  param('id').isUUID(),
+  body('channel_name').isString().trim().isLength({ min: 1, max: 50 }),
+  body('channel_type').isIn(['control', 'sensor']),
+  body('data_type').isIn(['toggle', 'slider', 'input', 'number', 'text']),
+  body('unit').optional({ nullable: true }).isString().trim(),
+  body('min_value').optional({ nullable: true }).isNumeric(),
+  body('max_value').optional({ nullable: true }).isNumeric(),
+  body('description').optional({ nullable: true }).isString().trim(),
+  validate,
+  async (req, res) => {
+    try {
+      // Verify device belongs to user
+      const { data: device, error: deviceError } = await req.supabase
+        .from('devices')
+        .select('id')
+        .eq('id', req.params.id)
+        .single();
+
+      if (deviceError || !device) {
+        return res.status(404).json({ error: 'Device not found' });
+      }
+
+      const { channel_name, channel_type, data_type, unit, min_value, max_value, description } = req.body;
+
+      const { data, error } = await req.supabase
+        .from('device_channels')
+        .insert({
+          device_id: req.params.id,
+          channel_name,
+          channel_type,
+          data_type,
+          unit: unit || null,
+          min_value: min_value ?? null,
+          max_value: max_value ?? null,
+          description: description || null,
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      res.status(201).json({ channel: data });
+    } catch (err) {
+      console.error('Error creating channel:', err);
+      res.status(500).json({ error: 'Failed to create channel' });
+    }
+  }
+);
+
+/**
+ * PATCH /api/devices/:id/channels/:channelId
+ * Update a channel
+ */
+router.patch('/:id/channels/:channelId',
+  param('id').isUUID(),
+  param('channelId').isUUID(),
+  body('channel_name').optional().isString().trim().isLength({ min: 1, max: 50 }),
+  body('channel_type').optional().isIn(['control', 'sensor']),
+  body('data_type').optional().isIn(['toggle', 'slider', 'input', 'number', 'text']),
+  body('unit').optional({ nullable: true }).isString().trim(),
+  body('min_value').optional({ nullable: true }).isNumeric(),
+  body('max_value').optional({ nullable: true }).isNumeric(),
+  body('description').optional({ nullable: true }).isString().trim(),
+  validate,
+  async (req, res) => {
+    try {
+      const updates = {};
+      const fields = ['channel_name', 'channel_type', 'data_type', 'unit', 'min_value', 'max_value', 'description'];
+      fields.forEach(f => {
+        if (req.body[f] !== undefined) updates[f] = req.body[f];
+      });
+
+      if (Object.keys(updates).length === 0) {
+        return res.status(400).json({ error: 'No valid fields to update' });
+      }
+
+      const { data, error } = await req.supabase
+        .from('device_channels')
+        .update(updates)
+        .eq('id', req.params.channelId)
+        .eq('device_id', req.params.id)
+        .select()
+        .single();
+
+      if (error) {
+        if (error.code === 'PGRST116') {
+          return res.status(404).json({ error: 'Channel not found' });
+        }
+        throw error;
+      }
+
+      res.json({ channel: data });
+    } catch (err) {
+      console.error('Error updating channel:', err);
+      res.status(500).json({ error: 'Failed to update channel' });
+    }
+  }
+);
+
+/**
+ * DELETE /api/devices/:id/channels/:channelId
+ * Delete a channel
+ */
+router.delete('/:id/channels/:channelId',
+  param('id').isUUID(),
+  param('channelId').isUUID(),
+  validate,
+  async (req, res) => {
+    try {
+      const { error } = await req.supabase
+        .from('device_channels')
+        .delete()
+        .eq('id', req.params.channelId)
+        .eq('device_id', req.params.id);
+
+      if (error) throw error;
+
+      res.status(204).send();
+    } catch (err) {
+      console.error('Error deleting channel:', err);
+      res.status(500).json({ error: 'Failed to delete channel' });
     }
   }
 );

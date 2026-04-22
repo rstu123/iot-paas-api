@@ -24,3 +24,10 @@ Thumbs.db
 # Build
 dist/
 build/
+
+# backup
+*.bak
+*.bak2
+*.bak2~
+test-supabase.js
+package-lock.json
